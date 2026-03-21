@@ -101,8 +101,6 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.02))
-    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
-    qat_bits = int(os.environ.get("QAT_BITS", 6))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_every = int(os.environ.get("SWA_EVERY", 200))
 
@@ -163,9 +161,6 @@ class Muon(torch.optim.Optimizer):
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
                     g = p.grad
-                    # NorMuon: orthogonalize first, then apply momentum.
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     state = self.state[p]
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
@@ -173,6 +168,9 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
+                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    # Scale correction from Muon reference implementations.
+                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
 
@@ -186,24 +184,6 @@ class Muon(torch.optim.Optimizer):
                 curr += p.numel()
 
         return loss
-
-
-# -----------------------------
-# STE QUANTIZATION-AWARE TRAINING
-# -----------------------------
-
-def fake_quantize_ste(w: Tensor, bits: int = 6) -> Tensor:
-    """Fake-quantize weights during forward pass; straight-through estimator on backward."""
-    max_val = (2 ** (bits - 1)) - 1  # int6: 31
-    w32 = w.float()
-    if w32.ndim == 2:
-        abs_max = w32.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
-    else:
-        abs_max = w32.abs().amax().clamp_min(1e-8)
-    scale = abs_max / max_val
-    q = (w32 / scale).round().clamp(-max_val, max_val)
-    # STE: forward uses quantized, backward flows through as if identity
-    return (q * scale - w32).detach() + w32
 
 
 # -----------------------------
@@ -563,15 +543,9 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
-    # When qat_bits > 0, fake-quantize weights during training for quantization-aware training.
-    qat_bits: int = 0
-
     def forward(self, x: Tensor) -> Tensor:
-        w = self.weight
-        if self.training and self.qat_bits > 0:
-            w = fake_quantize_ste(w, bits=self.qat_bits)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, w.to(x.dtype), bias)
+        return F.linear(x, self.weight.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -995,8 +969,6 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
-            if args.qat_enabled:
-                module.qat_bits = args.qat_bits
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
