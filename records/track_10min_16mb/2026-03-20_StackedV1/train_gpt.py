@@ -25,18 +25,7 @@ try:
 except ImportError:
     _HAS_ZSTD = False
 
-try:
-    from flash_attn.flash_attn_interface import flash_attn_func as _fa3_func
-    _HAS_FA3 = True
-except ImportError:
-    _HAS_FA3 = False
 
-# Detect native GQA support in scaled_dot_product_attention (PyTorch >= 2.9.1).
-try:
-    import inspect as _inspect
-    _HAS_NATIVE_GQA = "enable_gqa" in _inspect.signature(F.scaled_dot_product_attention).parameters
-except Exception:
-    _HAS_NATIVE_GQA = False
 
 import numpy as np
 import sentencepiece as spm
@@ -632,6 +621,12 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
+    def _repeat_kv(self, k: Tensor, v: Tensor, bsz: int, seqlen: int) -> tuple[Tensor, Tensor]:
+        reps = self.num_heads // self.num_kv_heads
+        k = k[:, :, None, :, :].expand(-1, -1, reps, -1, -1).reshape(bsz, self.num_heads, seqlen, self.head_dim)
+        v = v[:, :, None, :, :].expand(-1, -1, reps, -1, -1).reshape(bsz, self.num_heads, seqlen, self.head_dim)
+        return k, v
+
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
@@ -643,27 +638,11 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        use_gqa = self.num_kv_heads != self.num_heads
-        if _HAS_FA3:
-            if use_gqa:
-                reps = self.num_heads // self.num_kv_heads
-                k = k[:, :, None, :, :].expand(-1, -1, reps, -1, -1).reshape(bsz, self.num_heads, seqlen, self.head_dim)
-                v = v[:, :, None, :, :].expand(-1, -1, reps, -1, -1).reshape(bsz, self.num_heads, seqlen, self.head_dim)
-            y = _fa3_func(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=True,
-            ).reshape(bsz, seqlen, dim)
-        elif _HAS_NATIVE_GQA:
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, is_causal=True, enable_gqa=use_gqa,
-            ).transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        else:
-            if use_gqa:
-                reps = self.num_heads // self.num_kv_heads
-                k = k[:, :, None, :, :].expand(-1, -1, reps, -1, -1).reshape(bsz, self.num_heads, seqlen, self.head_dim)
-                v = v[:, :, None, :, :].expand(-1, -1, reps, -1, -1).reshape(bsz, self.num_heads, seqlen, self.head_dim)
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, is_causal=True,
-            ).transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        if self.num_kv_heads != self.num_heads:
+            k, v = self._repeat_kv(k, v, bsz, seqlen)
+        y = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, is_causal=True,
+        ).transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
@@ -1192,16 +1171,15 @@ def main() -> None:
                     p.mul_(1.0 - args.muon_weight_decay * optimizer_muon.param_groups[0]["lr"])
         zero_grad_all()
 
-        # SWA: accumulate weight snapshots during warmdown phase.
+        # SWA: accumulate weight snapshots during warmdown phase (on GPU, no CPU copy).
         if args.swa_enabled and scale < 1.0 and args.swa_every > 0:
             if swa_state is None or step % args.swa_every == 0:
-                sd = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
                 if swa_state is None:
-                    swa_state = sd
+                    swa_state = {k: v.detach().clone() for k, v in base_model.state_dict().items()}
                     swa_count = 1
                 else:
-                    for k in swa_state:
-                        swa_state[k].add_(sd[k])
+                    for k, v in base_model.state_dict().items():
+                        swa_state[k].add_(v.detach())
                     swa_count += 1
 
         step += 1
@@ -1237,8 +1215,9 @@ def main() -> None:
     # Apply SWA averaged weights if we collected snapshots.
     if swa_state is not None and swa_count > 1:
         log0(f"swa: averaging {swa_count} checkpoints")
-        avg = {k: (v / swa_count) for k, v in swa_state.items()}
+        avg = {k: (v / swa_count).to(v.device) for k, v in swa_state.items()}
         base_model.load_state_dict(avg, strict=True)
+        del swa_state
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
